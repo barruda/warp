@@ -76,7 +76,26 @@ impl EventLoop {
         let num_rows = size_info.rows;
         let num_cols = size_info.columns;
 
-        format!("{CREATE_SESSION_ENDPOINT}?num_rows={num_rows}&num_cols={num_cols}")
+        // PASEO: the host page sets `window.PASEO_WARP_PTY_URL` (an absolute ws:// URL, possibly
+        // with its own query such as an auth token and cwd) before Warp starts. Warp rewrites the
+        // page URL after load, so the endpoint can't be read from `location` here.
+        let endpoint = Self::host_page_endpoint().unwrap_or_else(|| CREATE_SESSION_ENDPOINT.into());
+        let separator = if endpoint.contains('?') { '&' } else { '?' };
+        format!("{endpoint}{separator}num_rows={num_rows}&num_cols={num_cols}")
+    }
+
+    #[cfg(target_family = "wasm")]
+    fn host_page_endpoint() -> Option<String> {
+        let window = web_sys::window()?;
+        js_sys::Reflect::get(&window, &"PASEO_WARP_PTY_URL".into())
+            .ok()?
+            .as_string()
+            .filter(|url| !url.is_empty())
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    fn host_page_endpoint() -> Option<String> {
+        None
     }
 
     /// Starts tasks to listen to and write to the websocket.
