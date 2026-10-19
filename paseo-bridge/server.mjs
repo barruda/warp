@@ -72,8 +72,6 @@ const INDEX_HTML = `<!DOCTYPE html>
       if (value) pty.searchParams.set(key, value);
     }
     window.PASEO_WARP_PTY_URL = pty.toString();
-    const cwd = page.searchParams.get("cwd");
-    if (cwd) document.title = "Warp · " + cwd.split("/").filter(Boolean).pop();
     import("/assets/client/wasm/warp.js").then(({ default: init }) => init());
   </script>
 </body>
