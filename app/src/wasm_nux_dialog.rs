@@ -78,6 +78,12 @@ impl WasmNUXDialog {
     /// If the user dismisses the dialog without choosing a preference, we'll continue to use the default autodetection
     /// behavior: if Warp is installed, redirect to it; otherwise stay on the web.
     pub fn should_display(app: &AppContext) -> bool {
+        // PASEO: remote_tty builds run inside Paseo against a local shell; offering the desktop
+        // app there is noise.
+        if cfg!(feature = "remote_tty") {
+            return false;
+        }
+
         // Don't show on mobile devices - they can't use the desktop app
         if warpui::platform::wasm::is_mobile_device() {
             return false;

@@ -1931,7 +1931,13 @@ impl RootView {
         } else {
             cfg_if! {
                 if #[cfg(target_family = "wasm")] {
-                    AuthOnboardingState::WebImport(AuthOnboardingTarget::Workspace(workspace_args.into()))
+                    // PASEO: remote_tty builds run inside Paseo on a local origin, where importing
+                    // the app.warp.dev session can't work. Go loginless, like desktop's skip.
+                    if cfg!(feature = "remote_tty") {
+                        AuthOnboardingState::Terminal(workspace_args.create_workspace(ctx))
+                    } else {
+                        AuthOnboardingState::WebImport(AuthOnboardingTarget::Workspace(workspace_args.into()))
+                    }
                 } else {
 
                     if FeatureFlag::ForceLogin.is_enabled() {
