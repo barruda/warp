@@ -2898,6 +2898,9 @@ impl Workspace {
             settings_file_error,
         } = global_resource_handles.clone();
 
+        #[cfg(all(target_family = "wasm", feature = "remote_tty"))]
+        Self::listen_for_paseo_new_tab(ctx);
+
         let server_api_provider = ServerApiProvider::as_ref(ctx);
         let server_api = server_api_provider.get();
         let ai_client = server_api_provider.get_ai_client();
@@ -12758,6 +12761,20 @@ impl Workspace {
         ctx.open_url(
             "https://docs.warp.dev/support-and-community/troubleshooting-and-support/updating-warp",
         );
+    }
+
+    /// PASEO: the host page opens a terminal tab with
+    /// `window.dispatchEvent(new Event("paseo-warp-new-tab"))`, after pointing the `cwd` of
+    /// `window.PASEO_WARP_PTY_URL` at the folder it wants. Key events dispatched from JavaScript
+    /// don't reach Warp's keybindings, so the host can't press Ctrl+Shift+T itself.
+    #[cfg(all(target_family = "wasm", feature = "remote_tty"))]
+    fn listen_for_paseo_new_tab(ctx: &mut ViewContext<Self>) {
+        let (tx, rx) = async_channel::unbounded::<()>();
+        gloo::events::EventListener::new(&gloo::utils::window(), "paseo-warp-new-tab", move |_| {
+            let _ = tx.try_send(());
+        })
+        .forget();
+        let _ = ctx.spawn_stream_local(rx, |me, (), ctx| me.add_terminal_tab(false, ctx), |_, _| {});
     }
 
     pub fn add_terminal_tab(&mut self, hide_homepage: bool, ctx: &mut ViewContext<Self>) {
