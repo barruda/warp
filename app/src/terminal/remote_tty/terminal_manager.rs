@@ -15,7 +15,7 @@ use crate::terminal::event_listener::ChannelEventListener;
 use crate::terminal::model::session::Sessions;
 use crate::terminal::model_events::ModelEventDispatcher;
 use crate::terminal::remote_tty::event_loop::EventLoop;
-use crate::terminal::shell::{ShellName, ShellType};
+use crate::terminal::shell::ShellName;
 use crate::terminal::terminal_manager::BlockSpacing;
 use crate::terminal::writeable_pty::pty_controller::{EventLoopSendError, EventLoopSender};
 use crate::terminal::writeable_pty::terminal_manager_util::{
@@ -85,7 +85,8 @@ impl TerminalManager {
             ShellLaunchState::ShellSpawned {
                 available_shell: None,
                 display_name: ShellName::blank(),
-                shell_type: ShellType::Zsh,
+                // PASEO: the shell the host page asked the bridge for.
+                shell_type: EventLoop::host_page_shell_type(),
             },
             BlockSpacing::for_gui(ctx),
             ctx,

@@ -5,17 +5,23 @@
 // and appends `num_rows`/`num_cols`. Wire format:
 //   binary frames  -> raw PTY bytes, both directions
 //   text frames    -> JSON {width,height,width_px,height_px} resize (client -> server)
-// After connecting, Warp types its zsh bootstrap script into the PTY, so the shell must start the
-// way desktop Warp starts zsh: `exec -a -zsh zsh -g --no-rcs`
-// (crates/warp_terminal/src/local_tty/shell.rs).
+// The shell starts the way desktop Warp starts it (crates/warp_terminal/src/local_tty/shell.rs):
+//   bash  `exec -a bash bash --rcfile <(echo '<init>')`, where <init> is Warp's bash_init_shell.sh with the
+//         session id Warp sent in the /create URL (`shell=bash&session_id=…&honor_ps1=…`).
+//   zsh   `exec -a -zsh zsh -g --no-rcs`; Warp types the zsh init script into the PTY itself.
+// Either way the init script sends the InitShell hook and Warp then types the full bootstrap,
+// which sources the user's rc files (bash: /etc/profile and ~/.bash_profile, like a login shell).
+// A Warp build from before bash support sends no session_id and always gets zsh.
 //
 // The Paseo `warp` plugin runs this as a child process. Environment:
 //   WARP_BRIDGE_TOKEN  required for /create; pages get it in their URL (?token=...)
 //   PORT               0 picks a free port. Prints `WARP_BRIDGE_READY <port>` once listening.
 //   BUNDLE_DIR         the wasm bundle; defaults to the release build here, else the debug one.
+//   WARP_SHELL_TYPE    "bash" (default) or "zsh"; a page URL's ?shell= overrides it.
+//   WARP_BASH, WARP_ZSH  the shell binaries.
 // The bridge exits when its stdin closes, so it dies with the plugin process.
 
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { readFile, stat } from "node:fs/promises";
 import { createServer } from "node:http";
 import { extname, join, normalize, resolve } from "node:path";
@@ -28,6 +34,12 @@ const PORT = Number(process.env.PORT ?? 3030);
 const HOST = process.env.HOST ?? "127.0.0.1";
 const TOKEN = process.env.WARP_BRIDGE_TOKEN ?? "";
 const ZSH = process.env.WARP_ZSH ?? "/usr/bin/zsh";
+const BASH = process.env.WARP_BASH ?? "/bin/bash";
+const SHELL_TYPE = process.env.WARP_SHELL_TYPE === "zsh" ? "zsh" : "bash";
+const BASH_INIT = join(HERE, "../app/assets/bundled/bootstrap/bash_init_shell.sh");
+// Desktop Warp's BASH_HISTORY_SIZE_SENTINEL: bash loads the whole history file, and the bootstrap
+// unsets these again unless the user's rc files changed them.
+const BASH_HISTORY_SIZE_SENTINEL = "57265949261";
 
 // Re-resolved per request so a finished release build replaces the debug one without a restart.
 function bundleDir() {
@@ -72,6 +84,8 @@ const INDEX_HTML = `<!DOCTYPE html>
       if (value) pty.searchParams.set(key, value);
     }
     window.PASEO_WARP_PTY_URL = pty.toString();
+    const shell = page.searchParams.get("shell");
+    window.PASEO_WARP_SHELL = shell === "bash" || shell === "zsh" ? shell : "@@SHELL_TYPE@@";
     import("/assets/client/wasm/warp.js").then(({ default: init }) => init());
   </script>
 </body>
@@ -84,7 +98,7 @@ const server = createServer(async (req, res) => {
   const file = resolveBundlePath(pathname);
   if (file === "index") {
     res.writeHead(200, { "content-type": MIME[".html"], "cache-control": "no-cache" });
-    res.end(INDEX_HTML);
+    res.end(INDEX_HTML.replace("@@SHELL_TYPE@@", SHELL_TYPE));
     return;
   }
   if (!file) {
@@ -136,26 +150,47 @@ function startSession(ws, url) {
   const requestedCwd = url.searchParams.get("cwd");
   const cwd = requestedCwd && existsSync(requestedCwd) ? requestedCwd : os.homedir();
 
+  const sessionId = url.searchParams.get("session_id");
+  const bash = url.searchParams.get("shell") === "bash" && /^\d+$/.test(sessionId ?? "");
+
   const env = {
     ...process.env,
     TERM: "xterm-256color",
     TERM_PROGRAM: "WarpTerminal",
     COLORTERM: "truecolor",
-    SHELL: ZSH,
+    SHELL: bash ? BASH : ZSH,
     WARP_IS_LOCAL_SHELL_SESSION: "1",
     WARP_USE_SSH_WRAPPER: "0",
     WARP_INITIAL_WORKING_DIR: cwd,
   };
-  for (const key of ["DESKTOP_STARTUP_ID", "WARP_BRIDGE_TOKEN", "PORT", "BUNDLE_DIR"]) delete env[key];
+  for (const key of ["DESKTOP_STARTUP_ID", "WARP_BRIDGE_TOKEN", "PORT", "BUNDLE_DIR", "WARP_SHELL_TYPE"])
+    delete env[key];
 
-  const term = pty.spawn("/bin/bash", ["-c", `exec -a -zsh '${ZSH}' -g --no-rcs`], {
+  let command;
+  if (bash) {
+    Object.assign(env, {
+      HISTFILESIZE: BASH_HISTORY_SIZE_SENTINEL,
+      HISTSIZE: BASH_HISTORY_SIZE_SENTINEL,
+      WARP_INITIAL_HISTFILESIZE: BASH_HISTORY_SIZE_SENTINEL,
+      WARP_INITIAL_HISTSIZE: BASH_HISTORY_SIZE_SENTINEL,
+    });
+    // Like desktop Warp, the rcfile is a process substitution, so no file is left behind.
+    const init = bashInitScript(sessionId, url.searchParams.get("honor_ps1") === "1");
+    command = `exec -a bash '${BASH}' --rcfile <(echo '${init.replaceAll("'", `'"'"'`)}')`;
+  } else {
+    command = `exec -a -zsh '${ZSH}' -g --no-rcs`;
+  }
+
+  const term = pty.spawn("/bin/bash", ["-c", command], {
     name: "xterm-256color",
     cols,
     rows,
     cwd,
     env,
   });
-  console.log(`[bridge] session pid=${term.pid} ${cols}x${rows} cwd=${cwd}`);
+  console.log(
+    `[bridge] session pid=${term.pid} ${bash ? "bash" : "zsh"} ${cols}x${rows} cwd=${cwd}`,
+  );
 
   term.onData((data) => {
     if (ws.readyState === ws.OPEN) ws.send(Buffer.from(data, "utf8"), { binary: true });
@@ -182,6 +217,15 @@ function startSession(ws, url) {
       term.kill();
     } catch {}
   });
+}
+
+// Warp's bash_init_shell.sh, as desktop Warp fills it in (crates/warp_terminal/src/bootstrap.rs),
+// with the honor-PS1 setting the zsh path types into the PTY instead.
+function bashInitScript(sessionId, honorPs1) {
+  const script = readFileSync(BASH_INIT, "utf8")
+    .replaceAll("@@WARP_SESSION_ID@@", sessionId)
+    .replaceAll("@@USING_CON_PTY_BOOLEAN@@", "false");
+  return `WARP_HONOR_PS1="${honorPs1 ? 1 : 0}"\n${script}`;
 }
 
 server.listen(PORT, HOST, () => {

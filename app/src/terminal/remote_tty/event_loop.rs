@@ -37,6 +37,10 @@ pub(super) struct EventLoop {
     parser: Processor,
     event_loop_rx: Receiver<EventLoopMessage>,
     channel_event_listener: ChannelEventListener,
+    /// PASEO: the shell the bridge runs. Zsh is bootstrapped by typing its init script into the
+    /// PTY; bash gets its init script as an rcfile from the bridge, like desktop Warp's
+    /// `bash --rcfile`, so nothing is typed before its InitShell hook.
+    shell_type: ShellType,
 }
 
 impl EventLoop {
@@ -49,9 +53,21 @@ impl EventLoop {
         size_info: SizeInfo,
         ctx: &mut ModelContext<Self>,
     ) -> Self {
-        let event_loop = Self::new(model, websocket_receiver, channel_event_listener);
+        let shell_type = Self::host_page_shell_type();
+        let mut url = Self::get_new_session_url(size_info);
+        if shell_type == ShellType::Bash {
+            // PASEO: the bridge writes bash's rcfile, so it needs the session id Warp expects in
+            // the InitShell hook, and the honor-PS1 setting zsh would get typed into the PTY.
+            let session_id = crate::terminal::bootstrap::generate_session_id();
+            model.lock().register_session_id(session_id);
+            let honor_ps1 = *SessionSettings::as_ref(ctx).honor_ps1 as u8;
+            url.push_str(&format!(
+                "&shell=bash&session_id={}&honor_ps1={honor_ps1}",
+                session_id.as_u64()
+            ));
+        }
+        let event_loop = Self::new(model, websocket_receiver, channel_event_listener, shell_type);
 
-        let url = Self::get_new_session_url(size_info);
         let response = WebSocket::connect(url, None /* protocols */);
 
         ctx.spawn(response, Self::on_ws_connection);
@@ -63,12 +79,23 @@ impl EventLoop {
         terminal_model: Arc<FairMutex<TerminalModel>>,
         websocket_receiver: Receiver<EventLoopMessage>,
         channel_event_listener: ChannelEventListener,
+        shell_type: ShellType,
     ) -> Self {
         Self {
             terminal_model,
             parser: Processor::default(),
             event_loop_rx: websocket_receiver,
             channel_event_listener,
+            shell_type,
+        }
+    }
+
+    /// PASEO: the host page picks the shell with `window.PASEO_WARP_SHELL` ("bash" or "zsh").
+    /// Zsh when unset, which is what bridges from before bash support expect.
+    pub(super) fn host_page_shell_type() -> ShellType {
+        match Self::host_page_string("PASEO_WARP_SHELL").as_deref() {
+            Some("bash") => ShellType::Bash,
+            _ => ShellType::Zsh,
         }
     }
 
@@ -84,17 +111,21 @@ impl EventLoop {
         format!("{endpoint}{separator}num_rows={num_rows}&num_cols={num_cols}")
     }
 
-    #[cfg(target_family = "wasm")]
     fn host_page_endpoint() -> Option<String> {
+        Self::host_page_string("PASEO_WARP_PTY_URL")
+    }
+
+    #[cfg(target_family = "wasm")]
+    fn host_page_string(name: &str) -> Option<String> {
         let window = web_sys::window()?;
-        js_sys::Reflect::get(&window, &"PASEO_WARP_PTY_URL".into())
+        js_sys::Reflect::get(&window, &name.into())
             .ok()?
             .as_string()
-            .filter(|url| !url.is_empty())
+            .filter(|value| !value.is_empty())
     }
 
     #[cfg(not(target_family = "wasm"))]
-    fn host_page_endpoint() -> Option<String> {
+    fn host_page_string(_name: &str) -> Option<String> {
         None
     }
 
@@ -131,15 +162,19 @@ impl EventLoop {
 
         let terminal_model_for_init = self.terminal_model.clone();
         let receiver = self.event_loop_rx.clone();
+        let types_init_script = self.shell_type == ShellType::Zsh;
         ctx.background_executor()
             .spawn(async move {
-                if let Err(e) = Self::write_env_vars(&mut sink, is_honor_ps1_enabled).await {
-                    report_error!(e.context("Failed to write env vars to pty"));
-                }
-                if let Err(e) =
-                    Self::write_zsh_init_shell_script(&mut sink, &terminal_model_for_init).await
-                {
-                    report_error!(e.context("Failed to write zsh bootstrap bytes to pty"));
+                if types_init_script {
+                    if let Err(e) = Self::write_env_vars(&mut sink, is_honor_ps1_enabled).await {
+                        report_error!(e.context("Failed to write env vars to pty"));
+                    }
+                    if let Err(e) =
+                        Self::write_zsh_init_shell_script(&mut sink, &terminal_model_for_init)
+                            .await
+                    {
+                        report_error!(e.context("Failed to write zsh bootstrap bytes to pty"));
+                    }
                 }
 
                 while let Ok(message) = receiver.recv().await {
